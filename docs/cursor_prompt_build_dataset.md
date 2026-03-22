@@ -1,300 +1,348 @@
-# Cursor 提示词：构建 MAR 退化数据集
+# 给 Cursor 的提示词：从零构建 CT 金属伪影退化数据集
 
-> 将以下内容完整粘贴给 Cursor，让它帮你实现数据集构建。
-
----
-
-## 提示词正文
-
-```
-你现在需要帮我完成 MAR（Metal Artifact Reduction）项目的退化数据集构建。
-本项目的目标是：在无金属伪影的干净 CT 图像上，通过物理仿真合成含金属伪影的退化图像，
-形成配对数据集用于训练去伪影网络。
-
-项目仓库已有部分代码（基于 https://github.com/liaohaofu/adn 的 Python 改写版），
-但存在以下问题需要你补全和修正。请严格按照以下说明完成。
-
-================================================================
-一、项目结构总览
-================================================================
-
-MAR_SynCode/
-├── simulate_data.py          # 核心：金属伪影合成引擎（已完成）
-├── util_func.py              # 核心：物理仿真工具函数（已完成）
-├── prepare_deep_lesion.py    # 训练集生成入口（已完成，需修正路径）
-├── prepare_deep_lesion_texst.py  # 测试集生成入口（文件名拼写错误，需重命名）
-├── gene_h5list.py            # H5 文件索引生成（有 bug 需修复）
-├── config/
-│   ├── dataset_py_640geo.yaml   # 数据集参数配置
-│   ├── dataset.yaml             # 本地路径版配置
-│   └── adn.yaml                 # 训练配置
-├── adn/
-│   ├── build_gemotry.py         # CT 扇束几何构建（依赖 ODL）
-│   ├── build_gemotry_geo.py     # 可变投影数版本
-│   ├── build_gemotry_imagesize.py  # 可变图像尺寸版本
-│   ├── datasets/
-│   │   ├── __init__.py          # Dataset 工厂
-│   │   ├── deep_lesion.py       # DeepLesion PyTorch Dataset
-│   │   ├── spineweb.py          # Spineweb PyTorch Dataset
-│   │   └── nature_image.py      # NatureImage PyTorch Dataset
-│   └── utils/
-│       ├── __init__.py
-│       └── misc.py              # 通用工具
-├── data/
-│   └── deep_lesion/
-│       ├── image_list.txt       # 337,898 条图像路径
-│       ├── blacklist.json       # 排除列表
-│       └── metal_masks/         # 金属掩模 + 物理参数（.mat 文件）
-│           ├── SampleMasks.mat
-│           ├── MiuofH2O.mat
-│           ├── MiuofTi.mat / MiuofFe.mat / MiuofCu.mat / MiuofAu.mat
-│           ├── MiuofBONE_Cortical_ICRU44.mat
-│           └── GE14Spectrum120KVP.mat
-└── docs/
-
-================================================================
-二、需要你完成的具体任务（按优先级排序）
-================================================================
-
-【任务 1】修复 gene_h5list.py 的语法错误
---------------------------------------------------------------
-文件：gene_h5list.py，第 7 行
-问题：`os. listdir` 中间有一个空格，应改为 `os.listdir`
-修复后确保脚本可以正常运行。
-
-【任务 2】重命名 prepare_deep_lesion_texst.py → prepare_deep_lesion_test.py
---------------------------------------------------------------
-- 将文件重命名为 prepare_deep_lesion_test.py
-- 确认内部逻辑使用 `['test']` 作为 splits（当前已是）
-
-【任务 3】修正 config/dataset_py_640geo.yaml 中的路径
---------------------------------------------------------------
-当前 raw_dir 和 dataset_dir 指向腾讯云外部存储路径（不可用）：
-  raw_dir: /apdcephfs/share_1290796/hazelhwang/mardataset/Images_png
-  dataset_dir: /apdcephfs_cq3/share_1290796/hazelhwang/mardataset
-
-修改为本地相对路径：
-  raw_dir: data/deep_lesion/raw        # 用户需软链接到 DeepLesion Images_png
-  dataset_dir: data/deep_lesion        # 输出目录
-
-【任务 4】编写 prepare_spineweb.py（参考原始仓库）
---------------------------------------------------------------
-原始仓库 https://github.com/liaohaofu/adn 中有 prepare_spineweb.py，
-其功能是从 Spineweb 原始 MHD/NII.GZ 医学影像中提取切片，
-按是否含金属伪影分为 artifact / no_artifact 两类，最终输出 .npy 文件。
-
-请严格参考以下逻辑实现：
-
-```python
-# 核心流程：
-# 1. 读取 config/dataset.yaml 中的 spineweb 配置
-# 2. 遍历 raw_dir 下所有 patient 目录
-# 3. 对每个 volume（.mhd 或 .nii.gz）用 SimpleITK 读取
-# 4. 逐切片判断是否含金属伪影：
-#    - image.max() > max_hu[1]（默认 2500）→ 检测连通区域
-#      - 最大连通区域面积 > connected_area（默认 400 像素）→ "artifact"
-#      - 否则跳过（小金属碎片，不可用）
-#    - image.max() > max_hu[0]（默认 2000）但 <= max_hu[1] → 跳过（边界情况）
-#    - image.max() <= max_hu[0] → "no_artifact"
-# 5. Resize 到 image_size（默认 256×256）
-# 6. 保存为 .npy 文件，同时生成缩略图 .png
-# 7. 最后划分 train/test：
-#    - 随机打乱 patient 目录
-#    - 累计收集 num_tests（默认 200）张图像的 patient 作为测试集
-#    - 其余为训练集
-#    - 将文件移动到 train/artifact、train/no_artifact、test/artifact、test/no_artifact
-```
-
-需要的依赖：SimpleITK, torch (用于 make_grid 生成概览图), PIL, numpy, tqdm
-使用 adn.utils 中已有的 read_dir() 和 get_connected_components() 函数。
-
-【任务 5】确保 DeepLesion Dataset 类支持 H5 格式
---------------------------------------------------------------
-当前 adn/datasets/deep_lesion.py 中 load_data() 方法（第 92-95 行）使用的是 .mat 格式：
-```python
-def load_data(self, data_file):
-    gt = sio.loadmat(data_file[0])['image']
-    metal = sio.loadmat(data_file[1])['image']
-    return self.convert2coefficient(gt).T, metal
-```
-
-但 simulate_data.py 生成的数据是 .h5 (HDF5) 格式。需要修改 DeepLesion 类以支持 H5：
-
-1. 修改 __init__ 中的文件扫描逻辑：
-   - 将 predicate 从匹配 "gt.mat" 改为同时支持 "gt.mat" 和 "gt.h5"
-   - 将 metal_files 的匹配从 .mat 扩展为同时支持 .mat 和 .h5
-
-2. 修改 load_data() 方法：
-```python
-def load_data(self, data_file):
-    gt_file, metal_file = data_file
-    if gt_file.endswith('.h5'):
-        import h5py
-        with h5py.File(gt_file, 'r') as f:
-            gt = f['image'][()]       # 线衰减系数域，无需再转换
-        with h5py.File(metal_file, 'r') as f:
-            metal = f['ma_CT'][()]    # 含伪影的 CT
-        return gt, metal
-    else:
-        gt = sio.loadmat(gt_file)['image']
-        metal = sio.loadmat(metal_file)['image']
-        return self.convert2coefficient(gt).T, metal
-```
-
-注意：H5 格式的数据在 simulate_data.py 中已经转换为线衰减系数域（img = imgCT/1000*MiuWater+MiuWater），
-所以读取 H5 时不需要再调用 convert2coefficient()。
-
-【任务 6】编写完整的数据集构建运行脚本 build_dataset.sh
---------------------------------------------------------------
-编写一个 shell 脚本，整合所有步骤：
-
-```bash
-#!/bin/bash
-set -e
-
-echo "=== MAR Dataset Construction Pipeline ==="
-
-# Step 0: 检查依赖
-python -c "import odl; import torch; import h5py; import SimpleITK" || {
-    echo "缺少依赖，请先安装："
-    echo "  pip install odl torch h5py SimpleITK scipy numpy pillow tqdm pyyaml"
-    exit 1
-}
-
-# Step 1: 检查原始数据链接
-if [ ! -d "data/deep_lesion/raw" ]; then
-    echo "请先创建 DeepLesion 数据软链接："
-    echo "  ln -s /path/to/DeepLesion/Images_png data/deep_lesion/raw"
-    exit 1
-fi
-
-# Step 2: 生成 DeepLesion 训练集
-echo "[1/5] 生成 DeepLesion 训练集..."
-python prepare_deep_lesion.py
-
-# Step 3: 生成 DeepLesion 测试集
-echo "[2/5] 生成 DeepLesion 测试集..."
-python prepare_deep_lesion_test.py
-
-# Step 4: 生成 H5 文件索引
-echo "[3/5] 生成训练集 H5 索引..."
-python gene_h5list.py --h5_image data/deep_lesion/train_640geo --h5_list data/deep_lesion/train_640geo_dir.txt
-
-echo "[4/5] 生成测试集 H5 索引..."
-python gene_h5list.py --h5_image data/deep_lesion/test_640geo --h5_list data/deep_lesion/test_640geo_dir.txt
-
-# Step 5: 准备 Spineweb（如有原始数据）
-if [ -d "data/spineweb/raw" ]; then
-    echo "[5/5] 生成 Spineweb 数据集..."
-    python prepare_spineweb.py
-else
-    echo "[5/5] 跳过 Spineweb（未找到 data/spineweb/raw）"
-fi
-
-echo "=== 数据集构建完成 ==="
-```
-
-================================================================
-三、核心退化合成流程（供你理解，不需修改）
-================================================================
-
-simulate_data.py 中 simulate_metal_artifact() 的完整流程：
-
-1. 组织分解：将 CT 图像按 HU 阈值分解为水成分(imgWater)和骨成分(imgBone)
-   - 阈值：水 ≤ 100 HU (对应衰减系数 0.2112)，骨 ≥ 1500 HU (对应 0.48)
-   - 混合区域按线性插值分配
-
-2. 正弦图投影：用 ODL 的扇束几何对水和骨分别做前向投影 (Radon 变换)
-   - 416×416 图像 → 640×641 正弦图
-
-3. 多能量转换 (keV→kVp)：调用 pkev2kvp()
-   - 70keV 单能投影 → 120kVp 多色投影
-   - 按 GE14Spectrum120KVP 能谱加权
-
-4. 泊松噪声：模拟 2×10^7 光子 + 20 散射光子的量子噪声
-   - ProjPhoton = Poisson(round(exp(-proj) * photonNum) + 20)
-   - projNoise = -log(ProjPhoton / photonNum)
-
-5. 射束硬化校正 (BHC)：三阶多项式拟合
-   - 使用预计算的水基 BHC 系数 paraBHC
-
-6. 无金属基准：poly_CT = FBP(BHC后正弦图)，存为 gt.h5
-
-7. 金属伪影注入（对每个金属掩模并行执行）：
-   a) 金属前向投影 + 衰减系数缩放 (metalAtten)
-   b) 部分体积效应：边缘像素衰减降至 25%
-   c) 合成含金属正弦图 = 水 + 骨 + 金属投影 → pkev2kvp → 泊松噪声
-   d) 生成 3 种校正版本：
-      - ma_CT：直接 FBP 重建（含严重伪影）
-      - LI_CT：线性插值校正后 FBP
-      - BHC_CT：marBHC 射束硬化校正后
-   e) 保存为 {idx}.h5
-
-util_func.py 中的关键函数（不需修改）：
-- pkev2kvp(): 单能→多能投影转换
-- interpolate_projection(): 正弦图线性插值（金属区域用相邻非金属值填充）
-- marBHC(): 一阶多项式射束硬化校正
-- get_mar_params(): 加载所有物理参数（材料衰减、能谱、BHC 系数等）
-
-================================================================
-四、物理参数速查（不需修改，仅供参考）
-================================================================
-
-CT 几何（adn/build_gemotry.py）:
-  图像尺寸: 416×416
-  投影角度: 640
-  探测器元素: 641
-  源到物体距离: 1075 mm
-  重建方法: FBP (Ram-Lak 滤波器)
-
-物理常数（util_func.py::get_mar_params()）:
-  参考能量 kev = 70
-  管电压 kVp = 120
-  能量范围 = 20~120 keV
-  入射光子数 = 2×10^7
-  散射光子数 = 20
-  水衰减系数 MiuWater = 0.192 cm^-1
-  默认金属 = Titanium (密度 4.5 g/cm³, materialID=0)
-
-支持金属材料:
-  | ID | 材料 | 密度 (g/cm³) |
-  | 0  | Ti   | 4.5          |
-  | 1  | Fe   | 7.8          |
-  | 2  | Cu   | 8.9          |
-  | 3  | Au   | 2.0          |
-
-训练/测试划分:
-  训练: 1000 张 CT (indices = np.arange(0,1000)*40)，90 个金属掩模
-  测试: 200 张 CT (indices = np.arange(0,200)*10+44999)，10 个金属掩模
-
-================================================================
-五、不完整的部分请参考原始仓库
-================================================================
-
-如果以上信息不够完整，请参考：https://github.com/liaohaofu/adn
-
-重点参考文件：
-- prepare_deep_lesion.m（MATLAB 版数据准备，本项目已改写为 Python）
-- prepare_spineweb.py（Spineweb 数据准备，本项目需新建）
-- +helper/simulate_metal_artifact.m（MATLAB 版伪影合成，对应本项目 simulate_data.py）
-- +helper/pkev2kvp.m（对应 util_func.py::pkev2kvp()）
-- +helper/interpolate_projection.m（对应 util_func.py::interpolate_projection()）
-- +helper/get_mar_params.m（对应 util_func.py::get_mar_params()）
-- config/dataset.yaml（数据集配置参数）
-- adn/datasets/（Dataset 类定义）
-
-================================================================
-六、注意事项
-================================================================
-
-1. 不要修改 simulate_data.py 和 util_func.py，这两个文件已经验证正确
-2. ODL 库安装可能需要特殊处理：pip install odl
-3. DeepLesion 原始数据需要从 NIH 官网下载 Images_png_01~09.zip
-4. 所有 .h5 文件使用 gzip 压缩存储
-5. 数据归一化范围：线衰减系数 [0.0, 0.5] → [-1, 1]
-6. 金属掩模来自 SampleMasks.mat 中的 CT_samples_bwMetal，共 100 个掩模
-```
+> 直接将下方 `---` 之间的全部内容复制粘贴给 Cursor。
 
 ---
 
-以上提示词涵盖了所有退化数据集构建的方法细节。直接复制 ``` 内的内容粘贴给 Cursor 即可。
+我需要你帮我构建一个用于 CT 金属伪影去除（Metal Artifact Reduction, MAR）的退化数据集。
+目标是：给定干净的 CT 图像和金属掩模，通过物理仿真合成含金属伪影的退化图像，形成配对的 (GT, 退化图像) 数据集。
+
+不完整的部分请参考原始仓库 https://github.com/liaohaofu/adn ，特别是其中的 MATLAB 实现。
+
+请严格按照以下方法步骤构建。
+
+================================================================
+一、整体流水线概述
+================================================================
+
+输入：
+  - 干净 CT 图像（HU 值域，如 DeepLesion 的 16-bit PNG）
+  - 金属掩模（二值图，标注金属植入物区域，多个掩模存于一个 .mat 文件）
+  - 物理参数（材料衰减系数 .mat、X 射线能谱 .mat）
+
+输出（每张 CT × 每个金属掩模 → 一组 HDF5 文件）：
+  - gt.h5：包含 ground truth CT（线衰减系数域）、基准正弦图、基准重建
+  - {mask_idx}.h5：包含 ma_CT（含伪影）、LI_CT（线性插值校正）、BHC_CT（射束硬化校正）、对应正弦图、金属轨迹掩模
+
+流水线 7 个步骤：
+  1. HU → 线衰减系数转换
+  2. 组织分解（水 + 骨）
+  3. 前向投影（Radon 变换）→ 正弦图
+  4. 单能 → 多能转换（keV → kVp）
+  5. 泊松噪声仿真
+  6. 射束硬化校正（BHC）
+  7. 金属伪影注入 + 多种校正方法生成
+
+================================================================
+二、CT 几何与前向/反向投影
+================================================================
+
+使用 ODL 库构建扇束（Fan-Beam）CT 几何，参数如下：
+
+  图像尺寸：416 × 416 像素
+  像素分辨率：reso = 512/416 * 0.03 ≈ 0.0369 cm/pixel
+  物理尺寸：sx = sy = 416 * reso
+  投影角度数：640（0 到 2π 均匀分布）
+  探测器元素数：641
+  源到物体距离（SOD）：1075 * reso
+  探测器到中心距离（DDE）：1075 * reso
+  探测器总长度：su = 2 * sqrt(sx² + sy²)
+
+构建方法：
+```python
+import odl
+reco_space = odl.uniform_discr(
+    min_pt=[-sx/2, -sy/2], max_pt=[sx/2, sy/2],
+    shape=[416, 416], dtype='float32')
+angle_partition = odl.uniform_partition(0, 2*np.pi, 640)
+detector_partition = odl.uniform_partition(-su/2, su/2, 641)
+geometry = odl.tomo.FanBeamGeometry(
+    angle_partition, detector_partition,
+    src_radius=1075*reso, det_radius=1075*reso)
+ray_trafo = odl.tomo.RayTransform(reco_space, geometry, impl='astra_cuda')
+FBPOper = odl.tomo.fbp_op(ray_trafo, filter_type='Ram-Lak', frequency_scaling=1.0)
+```
+
+ray_trafo(image) 做前向投影（图像 → 正弦图）。
+FBPOper(sinogram) 做滤波反投影重建（正弦图 → 图像）。
+
+================================================================
+三、物理参数加载
+================================================================
+
+需要从 .mat 文件加载以下物理参数：
+
+材料衰减系数（质量衰减系数表，覆盖 1~120 keV，多种衰减模式列）：
+  - MiuofH2O.mat       → 水
+  - MiuofBONE_Cortical_ICRU44.mat → 皮质骨
+  - MiuofTi.mat        → 钛
+  - MiuofFe.mat        → 铁
+  - MiuofCu.mat        → 铜
+  - MiuofAu.mat        → 金
+
+X 射线能谱：
+  - GE14Spectrum120KVP.mat → 120kVp 管电压下的 GE 球管能谱
+    取第 2 列（索引 1）作为 spectrum
+
+关键常数：
+  kVp = 120                    # 管电压
+  kev = 70                     # 参考单能量
+  energies = np.arange(20, 121)  # 能量网格 20~120 keV
+  photonNum = 2e7              # 入射光子数
+  MiuWater = 0.192 cm⁻¹       # 70keV 下水的线衰减系数
+
+组织分割阈值（先转为线衰减系数域）：
+  threshWaterHU = 100 HU   → threshWater = 100/1000 * 0.192 + 0.192 = 0.2112
+  threshBoneHU = 1500 HU   → threshBone = 1500/1000 * 0.192 + 0.192 = 0.48
+
+金属材料参数（默认使用 Titanium, materialID=0）：
+  densityMetal = [4.5, 7.8, 8.9, 2.0]   # Ti, Fe, Cu, Au 密度 (g/cm³)
+  metalAtten = densityMetal[0] * MiuofMetal[kev-1, 6, 0]
+  # 其中 MiuofMetal 由 4 种金属的衰减系数沿第 3 维 stack 而成
+  # 列索引 6 对应 AttenuMode=7（total attenuation with coherent scattering）
+
+水基 BHC 多项式系数预计算：
+```python
+thickness = np.arange(0, 50.01, 0.05).reshape(-1, 1)  # 水厚度 (cm)
+pwaterkev = MiuofH2O[kev-1, 6] * thickness             # 单能投影
+pwaterkvp = pkev2kvp(pwaterkev, spectrum, energies, kev, MiuofH2O[:kVp, :])  # 多能投影
+A = np.concatenate([pwaterkvp, pwaterkvp**2, pwaterkvp**3], axis=1)
+paraBHC = np.linalg.pinv(A) @ pwaterkev                # 三阶多项式拟合系数
+```
+
+================================================================
+四、核心退化合成方法（逐步详解）
+================================================================
+
+### Step 1：HU → 线衰减系数
+
+原始 DeepLesion PNG 是 16-bit 无符号整数，需要转换：
+```python
+image = raw_png * 65536 - 32768    # 恢复 HU 值（带偏移）
+image = resize(image, (416, 416))  # 双线性插值缩放
+image[image < -1000] = -1000       # 裁剪下界（空气以下无意义）
+```
+
+### Step 2：组织成分分解
+
+将 CT 图像分解为水成分和骨成分，用于独立建模不同材料的衰减：
+```python
+img = imgCT / 1000 * MiuWater + MiuWater   # HU → 线衰减系数
+
+imgWater = np.zeros_like(img)
+imgBone = np.zeros_like(img)
+
+bwWater = (img <= threshWater)                    # 纯水区域
+bwBone = (img >= threshBone)                      # 纯骨区域
+bwBoth = ~bwWater & ~bwBone                       # 混合区域
+
+imgWater[bwWater] = img[bwWater]                  # 水区直接赋值
+imgBone[bwBone] = img[bwBone]                     # 骨区直接赋值
+# 混合区域按线性插值分配骨/水比例：
+imgBone[bwBoth] = (img[bwBoth] - threshWater) / (threshBone - threshWater) * img[bwBoth]
+imgWater[bwBoth] = img[bwBoth] - imgBone[bwBoth]
+```
+
+### Step 3：前向投影
+
+对水和骨分别做 Radon 变换，得到各自的正弦图：
+```python
+Pwater_kev = ray_trafo(imgWater)   # shape: (640, 641)
+Pbone_kev = ray_trafo(imgBone)     # shape: (640, 641)
+```
+
+### Step 4：单能 → 多能投影转换（pkev2kvp）
+
+这是物理仿真的核心。真实 X 射线是多色的（包含多个能量），不同能量下材料的衰减系数不同。
+
+方法：对每个能量 ien（20~120 keV），将参考能量 kev=70 下的投影按衰减系数比值缩放，再按能谱加权求和：
+
+```python
+def pkev2kvp(projkevAll, spectrum, energies, kev, MiuAll):
+    """
+    projkevAll: shape (views, bins, num_materials), 每种材料在 kev 下的投影
+    spectrum: shape (120,), X射线能谱强度分布
+    energies: array [20, 21, ..., 120], 能量网格
+    kev: int, 参考能量（70）
+    MiuAll: shape (120, num_modes, num_materials), 质量衰减系数表
+    """
+    AttenuMode = 7  # 使用第 7 列（total attenuation with coherent scattering）
+    ProjEnergy = 0
+    for ien in energies:
+        for imat in range(num_materials):
+            # 当前能量下的投影 = 参考能量投影 × (当前能量衰减 / 参考能量衰减)
+            projAll[:,:,imat] = MiuAll[ien-1, AttenuMode-1, imat] / MiuAll[kev-1, AttenuMode-1, imat] * projkevAll[:,:,imat]
+        proj_total = sum(projAll, axis=2)              # 合并所有材料
+        ProjEnergy += spectrum[ien-1] * exp(-proj_total)  # Beer-Lambert 定律 + 能谱加权
+
+    projkvp = -log(ProjEnergy / sum(spectrum[energies-1]))  # 归一化后取负对数
+    return projkvp
+```
+
+### Step 5：泊松噪声仿真
+
+模拟 X 射线探测器的光子计数统计噪声：
+```python
+scatterPhoton = 20                                    # 散射光子常数
+expected_photons = round(exp(-projkvp) * photonNum)   # 期望到达光子数
+expected_photons += scatterPhoton                     # 加散射
+actual_photons = np.random.poisson(expected_photons)  # 泊松采样
+actual_photons[actual_photons == 0] = 1               # 避免 log(0)
+projkvpNoise = -log(actual_photons / photonNum)       # 含噪声的投影
+```
+
+### Step 6：水基射束硬化校正（BHC）
+
+使用预计算的三阶多项式系数对投影做 BHC：
+```python
+p1 = projkvpNoise.reshape(-1, 1)
+p1BHC = np.concatenate([p1, p1**2, p1**3], axis=1) @ paraBHC   # 三阶多项式
+poly_sinogram = p1BHC.reshape(views, bins)
+poly_CT = FBPOper(poly_sinogram)   # FBP 重建 → 无金属、有噪声、已BHC的基准CT
+```
+
+这个 poly_CT 连同原始线衰减系数图 gt_CT 一起存为 gt.h5。
+
+### Step 7：金属伪影注入
+
+对每个金属掩模执行以下操作：
+
+#### 7a. 金属前向投影 + 衰减
+```python
+imgMetal = resize(metal_mask, (416, 416))   # 缩放到 CT 尺寸
+Pmetal_kev = ray_trafo(imgMetal)            # 前向投影
+metal_trace = (Pmetal_kev > 0)              # 金属在正弦图中的轨迹
+Pmetal_kev *= metalAtten                    # 乘以金属线衰减系数
+```
+
+#### 7b. 部分体积效应（Partial Volume Effect）校正
+金属边缘像素只占部分体素，衰减不应为 100%：
+```python
+Pmetal_bw = binary_erosion(Pmetal_kev > 0, structure=np.ones((1, 3)))  # 腐蚀
+Pmetal_edge = np.logical_xor(Pmetal_kev > 0, Pmetal_bw)               # 边缘 = 原始 XOR 腐蚀
+Pmetal_kev[Pmetal_edge] /= 4                                          # 边缘衰减降至 25%
+```
+
+#### 7c. 含金属正弦图合成
+```python
+projkevAll[:, :, 2] = Pmetal_kev          # 第 3 个材料通道 = 金属
+projkvpMetal = pkev2kvp(projkevAll, ...)   # 水 + 骨 + 金属的多能投影
+# 再加泊松噪声（与 Step 5 相同方法）
+```
+
+#### 7d. 三种校正结果生成
+
+(1) 直接重建（含严重伪影）：
+```python
+p1 = projkvpMetalNoise.reshape(-1, 1)
+ma_sinogram = (np.concatenate([p1, p1**2, p1**3], axis=1) @ paraBHC).reshape(views, bins)
+ma_CT = FBPOper(ma_sinogram)
+```
+
+(2) 线性插值（LI）校正：
+正弦图中金属轨迹处的值用相邻非金属位置的值线性插值替代：
+```python
+def interpolate_projection(proj, metalTrace):
+    Pinterp = proj.copy()
+    for each row i:
+        metalpos = where(metalTrace[i] == 1)
+        nonmetalpos = where(metalTrace[i] == 0)
+        Pinterp[i, metalpos] = interp1d(nonmetalpos, proj[i, nonmetalpos])(metalpos)
+    return Pinterp
+
+LI_sinogram = interpolate_projection(ma_sinogram, metal_trace)
+LI_CT = FBPOper(LI_sinogram)
+```
+
+(3) MAR 射束硬化校正（marBHC）：
+```python
+def marBHC(proj, metalBW, ray_trafo, FBPOper):
+    projMetal = ray_trafo(metalBW)                  # 金属前向投影
+    Pinterp = interpolate_projection(proj, projMetal > 0)  # LI 校正
+    projDiff = proj - Pinterp                       # 残差 = 原始 - LI
+
+    # 对金属投影区域做三阶多项式最小二乘拟合
+    A[:, 0] = projMetal_masked
+    A[:, 1] = projMetal_masked ** 2
+    A[:, 2] = projMetal_masked ** 3
+    X0 = lstsq(A, projDiff_masked)                  # 拟合系数
+
+    # 用拟合结果校正
+    projDelta = X0[0]*projMetal - polyval(X0, projMetal)
+    projBHC = proj + projDelta
+    imBHC = FBPOper(projBHC)
+    return imBHC, projBHC
+```
+
+================================================================
+五、输出数据格式
+================================================================
+
+每张 CT 图像生成一个子目录，结构如下：
+
+```
+output_dir/<patient>/<slice>/
+├── gt.h5
+│   ├── image          (float32) 无伪影 GT，线衰减系数域
+│   ├── poly_sinogram  (float32) BHC 基准正弦图
+│   └── poly_CT        (float32) 基准重建 CT
+├── 0.h5               (第 0 个金属掩模)
+│   ├── ma_CT          (float32) 含伪影 CT
+│   ├── LI_CT          (float32) LI 校正 CT
+│   ├── BHC_CT         (float32) BHC 校正 CT
+│   ├── ma_sinogram    (float32) 含伪影正弦图
+│   ├── LI_sinogram    (float32) LI 校正正弦图
+│   ├── BHC_sinogram   (float32) BHC 校正正弦图
+│   └── metal_trace    (uint8)   金属投影轨迹二值掩模
+├── 1.h5               (第 1 个金属掩模)
+└── ...
+```
+
+所有 HDF5 数据使用 gzip 压缩。
+
+================================================================
+六、数据集加载（PyTorch Dataset）
+================================================================
+
+训练时的加载与归一化方法：
+
+值域：线衰减系数 [0.0, 0.5] → 归一化到 [-1, 1]
+```python
+# 归一化
+data = np.clip(data, 0.0, 0.5)
+data = (data - 0.0) / (0.5 - 0.0) * 2.0 - 1.0
+
+# 反归一化
+data = data * 0.5 + 0.5
+data = data * (0.5 - 0.0) + 0.0
+```
+
+GT 读取 gt.h5 中的 'image' 字段。
+退化图像读取 {idx}.h5 中的 'ma_CT' 字段。
+两者已在线衰减系数域，无需额外转换。
+
+数据增强：训练时随机水平翻转 + 随机选择金属掩模索引。
+
+================================================================
+七、依赖库
+================================================================
+
+pip install odl numpy scipy h5py pillow tqdm pyyaml
+
+ODL 用于 CT 前向/反向投影（需要 ASTRA-Toolbox 的 CUDA 支持）。
+如果没有 GPU，可以将 impl='astra_cuda' 改为 impl='astra_cpu' 或使用 ODL 内置实现。
+
+================================================================
+八、参考原始实现
+================================================================
+
+以上方法改写自 https://github.com/liaohaofu/adn 的 MATLAB 实现。
+如有不清楚的地方，请参考该仓库中的：
+  - +helper/simulate_metal_artifact.m  → 伪影合成主函数
+  - +helper/pkev2kvp.m                 → 多能量转换
+  - +helper/interpolate_projection.m   → 线性插值校正
+  - +helper/get_mar_params.m           → 物理参数加载
+  - prepare_deep_lesion.m              → 数据准备入口
+  - config/dataset.yaml                → 配置参数
+
+---
